@@ -1,0 +1,17 @@
+simulate > sim1.fa
+simulate > sim2.fa
+simulate > sim3.fa
+simulate > sim4.fa
+simulate > sim5.fa
+simulate > sim6.fa
+simulate > sim7.fa
+simulate > sim8.fa
+simulate > sim9.fa
+simulate > sim10.fa
+simulate > sim11.fa
+simulate > sim12.fa
+simulate > sim13.fa
+simulate > sim14.fa
+simulate > sim15.fa
+simulate > sim16.fa
+simulate > sim17.fa
