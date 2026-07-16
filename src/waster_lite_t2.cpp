@@ -12,26 +12,19 @@
 #include <deque>
 #include <array>
 #include <cmath>
+#include <bitset>
+
+#include "sequence_utilities.hpp"
 
 using std::string;
 using std::tuple;
 using std::vector;
 using std::array;
 
-//kSize: odd for WASTER.
-#ifdef DEBUG
-
-    // std::vector<std::vector<unsigned char>> FilterTable(16ULL * (1ULL << 29), 64);
-    
-
-#else
-
-
-
-#endif
-
 const int kSize = 21;
 const int kFlankSize = (int)(kSize-1) / 2;
+const unsigned ll B_SIZE = 1ULL<<29;
+const char EMPTY = 0b00;
 
 typedef long long ll;
 
@@ -39,6 +32,7 @@ static_assert(kFlankSize * 2 <= 64, "Sequence too long for 64-bit hash");
 
 struct HashSquare;
 struct Filter;
+struct BinSeq;
 
 ll SeqHash(const string&);
 string Hash2Seq(const ll);
@@ -46,6 +40,56 @@ string RevComp(string);
 template<typename T> 
 T RevCompHash(T);
 inline HashSquare ProcessSingleMer(string);
+
+struct BinSeq{
+    const static int K = 10, SHIFT = 2 * (K-1);
+    const static int MASK = (1 << SHIFT) - 1;
+    
+    std::bitset<1ULL << 30> seq;
+
+    int n=0, m=0;
+    ll count = 0, seqlength;
+
+    template<typename T>
+    char TwoBit(T address){
+        // return ((this->seq[address * 2] ? 1 : 0) << 2) | (this->seq[address * 2 + 1] ? 1 : 0);
+        return 2 * seq[address * 2] + seq[address * 2 + 1];
+    }
+
+    bool Yieldable(){
+        return count > seqlength ? false : true;
+    }
+
+    tuple<int, int> Yield(){
+        // seq <<= 2;
+        n = ((n & MASK) << 2) | TwoBit(count);
+        m = (m >> 2) | ((3u ^ TwoBit(count + K + 1)) << SHIFT);
+        
+        count ++;
+        return n > m ? std::make_tuple(n, m) : std::make_tuple(m, n);
+    }
+
+    BinSeq(const string& sequence) {
+        seqlength = sequence.size();
+        for (int i=0; i < sequence.size(); i++){
+
+            switch (sequence[i]){
+                case 'a':{
+                    seq[2 * i] = 0; seq[2 * i + 1] = 0; break;
+                } case 'c': {
+                    seq[2 * i] = 0; seq[2 * i + 1] = 1; break;
+                } case 'g':{
+                    seq[2 * i] = 1; seq[2 * i + 1] = 0; break;
+                } case 't':{
+                    seq[2 * i] = 1; seq[2 * i + 1] = 1; break;
+                }
+            }
+        }
+        for (char i = 0 ; i < K - 1; i++){
+            Yield();
+        }
+    }
+};
 
 struct HashSquare {
     ll n, m, c;
@@ -96,17 +140,6 @@ inline HashSquare ProcessSingleMer(string Mer){
     return hs;
 }
 
-struct Filter{
-    
-    Filter(){
-        //input by ifstream/ofstream
-        //yield k-mer by coroutine
-        if (true){
-            string Mer = "ATCG";
-            //split into n m c
-        }
-    }
-};
 
 template <typename T>
 T RevCompHash(T x) {
@@ -178,12 +211,6 @@ string RevComp(string Seq){
     return RCSeq;
 }
 
-void RandomizedFilter(){
-    //ifstream
-    ll Filtered[16][1<<29];
-
-}
-
 std::pair<ll, ll> recover_n_m(ll t, ll b, ll r) {
     ll k = (b * 65 + r) * 17 + t;
     ll lo = 0, hi = (1LL << 20);
@@ -197,196 +224,86 @@ std::pair<ll, ll> recover_n_m(ll t, ll b, ll r) {
     return {n, m};
 }
 
+template <typename Table>
+void FilterInputWorker(Table &FilterTable, string fileName, int fileorder){
+    std::cerr << "thread: " << fileorder << std::endl;
+    SeqParser* seqfile = new SeqParser(fileName);
+    while (seqfile->nextSeq()) {
+        BinSeq* sequence = new BinSeq(seqfile->getSeq(1)); // fix to adapt for FASTQ real files.
+        ll n, m;
+        while(sequence->Yieldable()){
+            std::tie(n, m) = sequence->Yield();
+            HashSquare hs(n, m, EMPTY);
+            
+            if (hs.discard || (hs.t == 16 || hs.b > 62) || (hs.t != fileorder)) continue;
+            FilterTable(hs.t, hs.b) = std::min(int(FilterTable(hs.t, hs.b)), int(hs.r));
+        }
+    }
+    std::cerr << std::format("[Task {}]", fileName) << "finished.\n";
+
+}
+
+template <typename FTable, typename ETable>
+void CrossStatWorker(FTable &FilterTable, ETable &EsTable, tuple<string, string, string, string> fileNames, int fileorder){
+    SeqParser* seqfile = new SeqParser(fileName);
+    while (seqfile->nextSeq()) {
+        BinSeq* sequence = new BinSeq(seqfile->getSeq(1));
+        ll n, m;
+        while(sequence->Yieldable()){
+            std::tie(n, m) = sequence->Yield();
+            HashSquare hs(n, m, EMPTY);
+            
+            if (hs.discard || (hs.t == 16 || hs.b > 62)) continue;
+            if (hs.t >=0 && hs.t <4 && hs.t != fileorder && hs.r == FilterTable(fileorder, hs.b)){
+                ETable[hs.t][hs.b] = 1;
+            }
+        }
+    }
+}
+
+template <typename FTable, typename ETable>
+void StatDepoWorker(FTable &FilterTable, ETable &EsTable, int fileorder){
+    // for(ll b=0; b<B_SIZE; b++){
+        //128 = 2*2*2*2*2*2*2 = 10000000 so 127 = 1111111 64=1000000 63=111111
+        FilterTable(b, fileorder) = 
+            ((ETable[0][b] + ETable[1][b] + ETable[2][b] + ETable[3][b] - ETable[fileorder][b]) << 6) | FilterTable(b, fileorder);
+    // }
+}
+
 int main(int argc, char** argv){
     std::cerr<<"Initializing\n";
 
-    char* FTdata = new char[16 * (1ULL<<29)];
+    char* FTdata = new char[16 * (B_SIZE)];
 
-    std::fill_n (FTdata, 16 * (1ULL<<29), 64);
+    std::fill_n (FTdata, 16 * (B_SIZE), 64);
 
     auto FilterTable = [&](size_t i, size_t j) -> char& {
-        return FTdata[i * (1ULL<<29) + j];
+        return FTdata[i * (B_SIZE) + j];
     };
-    // if(true){
-    //     //TEST 1: 21-mer parsing and 
-    //     vector<string> MerVec = {
-    //         string("AAAAAAAAAAGTTTTTTTTTT"),
-    //         string("TAAAAAAAAAGTTTTTTTTTT"),
-    //         string("ATTTTTTTTTGTTTTTTTTTT")
-    //     };
 
-    //     for (auto Mer : MerVec){
-    //         auto hs = ProcessSingleMer(Mer);
-    //         std::cerr << "This is mer " << '"' << Mer << '"' << std::endl;
-    //         std::cerr << "discard? - " << hs.discard << std::endl;
-    //         std::cerr << "reverse? - " << hs.reverse << std::endl;   
-            
-    //         //try restore the kmer from m n c
-    //         std::cerr << "kmer: " << RevComp(Hash2RCSeq(hs.n)) << ' ' << RevComp(Hash2RCSeq(hs.c)) << ' ' << Hash2RCSeq(hs.m) << std::endl;
-    //     }
-    // }
+    if(true){
+        std::cerr << "Testing reads\n";
 
-    if(true){     
-        // TEST 2: core k-mers callback
-        std::cerr << "Initialization started.\n";
-
-        std::cerr << "Finished.\n";
-
-        for (int i = 0; i < 16; i ++){
-            std::cerr<<"\nStart to parse: sim" << i+1 << std::endl;
-            auto valid = freopen(std::format("./sim{}.fa", i+1).c_str(), "r", stdin);
-            if (valid == nullptr) std::cerr << "Failed to open!\n";
-            std::cin.clear(); 
-
-
-            std::string header;
-            std::getline(std::cin, header); // discard FASTA header
-            std::cerr << "Header: " << header << std::endl;
-            
-            std::deque<char> window;
-            char ch;
-            int count = 0;
-            
-            // FilterTable(0,0) = char(0);
-            while (std::cin.get(ch)) {
-                if (ch != 'a' && ch != 'c' && ch != 't' && ch != 'g') {
-                    // 打印所有被跳过的字符（包括换行符等）
-                    // std::cerr << "Skipping char: " << int((unsigned char)ch) << " ('" << ch << "')\n";
-                    continue;
-                }
-                window.push_back(ch);
-                if (count % (1000 * 1000 * 10) == 0) {
-                    std::cerr<<'\r'<<"Processing: "<<count << '\n';
-                }
-                if (window.size() == kSize) {
-                    std::string kmer(window.begin(), window.end());
-
-                    
-                    auto hs = ProcessSingleMer(kmer);
-                    if (hs.discard || (hs.t == 16 || hs.b == 64) || (hs.t != i)) {window.pop_front();count+=1;continue;}
-                    // std::cerr<<"Valid kmer: " << kmer << " - ";
-                    FilterTable(hs.t, hs.b) = std::min(int(FilterTable(hs.t, hs.b)), int(hs.r));
-                    // std::cerr<< FilterTable(hs.t, hs.b) << std::endl;
-                    
-                    window.pop_front();
-
-                }
-                count += 1;
-            }
-
-            
-            fclose(stdin);
-            
-            std::cerr<<"\nStart to parse: sim" << 17 << std::endl;
-            valid = freopen("./sim17.fa", "r", stdin);
-            if (valid == nullptr) std::cerr << "Failed to open!\n";
-            std::cin.clear(); 
-
-            std::getline(std::cin, header);
-            std::cerr << "Header: " << header << std::endl;
-
-            window.clear();
-            count = 0;
-            while (std::cin.get(ch)) {
-                if (ch != 'a' && ch != 'c' && ch != 't' && ch != 'g') {
-                    // 打印所有被跳过的字符（包括换行符等）
-                    // std::cerr << "Skipping char: " << int((unsigned char)ch) << " ('" << ch << "')\n";
-                    continue;
-                }
-                window.push_back(ch);
-                if (count % (1000 * 1000) == 0) std::cerr<<'\r'<<"Processing: "<<count;
-                if (window.size() == kSize) {
-                    std::string kmer(window.begin(), window.end());
-                    
-                    auto hs = ProcessSingleMer(kmer);
-
-                    if (hs.discard || (hs.t == 16 || hs.b == 64) || (hs.t != i)) {window.pop_front();count+=1;continue;}
-
-                    FilterTable(hs.t, hs.b) = std::min(int(FilterTable(hs.t, hs.b)), int(hs.r));
-                    
-                    window.pop_front();
-                }
-                count += 1;
-            }
-
-            fclose(stdin);
+        std::vector<std::thread> threads;
+        for (int i=0; i<17; i++){
+            std::cerr << "Initializing thread " << i << std::endl;
+            std::string fileName = std::format("sim{}.seq", i);
+            threads.emplace_back(FilterInputWorker<decltype(FilterTable)>, 
+                std::ref(FilterTable), std::move(fileName), i);
         }
 
-        fclose(stdin);
-
-        std::cerr <<"\nfinish parsing.\n";
-
-        std::cerr << "Previewing partial matrix\n";
-
-        for (int i=0; i<16; i++){
-            for (int j=0; j<16; j++){
-                std::cerr << (int)FilterTable(i, j) << ' ';
-            }
-            putchar('\n');
+        for (auto& t : threads) {
+            t.join();
         }
+    }
 
-        // std::cerr << "Start recovering k-mers\n";
-        
-        // for(ll i = 0; i < 16; i++){
-        //     for(ll j=0; j < 1ULL<<29; j++){
-        //         if (int(FilterTable(i, j)) != 64){
-        //             std::cerr << "Found valid k-mer:" << i << ' ' << j;
-        //             auto t=i, b=j, r=ll(FilterTable(i, j));
-        //             auto v=b * 65 + r;
-        //             auto k=v*17+t;
-        //             auto nm = recover_n_m(t, b, r);
-        //             auto n = nm.first;
-        //             auto m = nm.second;
-        //             std::cerr << RevComp(Hash2RCSeq(n)) << 'N' << Hash2RCSeq(m) << std::endl;
-        //         }
-        //     }
-        // }
+    if(true){
+        std::cerr << "Estimating...\n";
+        std::vector<std::vector<std::unique_ptr<std::bitset<N>>>> EsTable(4, std::vector<std::unique_ptr<std::bitset<B_SIZE>>>(4));
 
-        std::cerr << "Start stating k-mers\n";
+    }
 
-        auto valid = freopen("./sim17.fa", "r", stdin);
-        if (valid == nullptr) std::cerr << "Failed to open!\n";
-        std::cin.clear(); 
+    std::cerr << "Finished";
 
-        string header;
-        std::getline(std::cin, header);
-        std::cerr << "Header: " << header << std::endl;
-
-        std::deque<char> window;
-        char ch;
-
-        window.clear();
-        ll count = 0;
-        ll kmer_count = 0;
-        ll hits = 0;
-        ll cnt[16] = {};
-        while (std::cin.get(ch)) {
-            if (ch != 'a' && ch != 'c' && ch != 't' && ch != 'g') {
-                // 打印所有被跳过的字符（包括换行符等）
-                // std::cerr << "Skipping char: " << int((unsigned char)ch) << " ('" << ch << "')\n";
-                continue;
-            }
-            window.push_back(ch);
-            if (count % (1000 * 1000) == 0) std::cerr<<'\r'<<"Processing: "<<count;
-            if (window.size() == kSize) {
-                std::string kmer(window.begin(), window.end());
-                kmer_count ++;
-                
-                auto hs = ProcessSingleMer(kmer);
-
-                if (hs.discard || (hs.t == 16 || hs.b == 64)) {window.pop_front();count+=1;continue;}
-
-                if (FilterTable(hs.t, hs.b) == hs.r && hs.r != 64) {hits++;cnt[hs.t]++;}
-                
-                window.pop_front();
-            }
-            count += 1;
-        }
-        std::cerr << "total kmers: " << kmer_count << '\n';
-        std::cerr << "       hits: " << hits << '\n';
-
-        for (auto i: cnt) std::cerr << i << ' ';
-        std::cerr << '\n';
-    } 
     return 0;
 }
