@@ -23,7 +23,7 @@ using std::array;
 
 const int kSize = 21;
 const int kFlankSize = (int)(kSize-1) / 2;
-const unsigned ll B_SIZE = 1ULL<<29;
+const unsigned long long B_SIZE = 1ULL<<29;
 const char EMPTY = 0b00;
 
 typedef long long ll;
@@ -235,7 +235,7 @@ void FilterInputWorker(Table &FilterTable, string fileName, int fileorder){
             std::tie(n, m) = sequence->Yield();
             HashSquare hs(n, m, EMPTY);
             
-            if (hs.discard || (hs.t == 16 || hs.b > 62) || (hs.t != fileorder)) continue;
+            if ((hs.discard || hs.t == 16) || (hs.t != fileorder)) continue;
             FilterTable(hs.t, hs.b) = std::min(int(FilterTable(hs.t, hs.b)), int(hs.r));
         }
     }
@@ -244,7 +244,8 @@ void FilterInputWorker(Table &FilterTable, string fileName, int fileorder){
 }
 
 template <typename FTable, typename ETable>
-void CrossStatWorker(FTable &FilterTable, ETable &EsTable, tuple<string, string, string, string> fileNames, int fileorder){
+void CrossStatWorker(FTable &FilterTable, ETable &EsTable, string fileName, int fileorder){
+    std::cerr << std::format("This is task: {}\n", fileorder);
     SeqParser* seqfile = new SeqParser(fileName);
     while (seqfile->nextSeq()) {
         BinSeq* sequence = new BinSeq(seqfile->getSeq(1));
@@ -253,21 +254,32 @@ void CrossStatWorker(FTable &FilterTable, ETable &EsTable, tuple<string, string,
             std::tie(n, m) = sequence->Yield();
             HashSquare hs(n, m, EMPTY);
             
-            if (hs.discard || (hs.t == 16 || hs.b > 62)) continue;
-            if (hs.t >=0 && hs.t <4 && hs.t != fileorder && hs.r == FilterTable(fileorder, hs.b)){
-                ETable[hs.t][hs.b] = 1;
+            if (hs.discard || hs.t == 16) continue;
+            // if (hs.t >=0 && hs.t <4 && hs.t != fileorder && hs.r == FilterTable(fileorder, hs.b) && hs.r < 63){
+            //     (*EsTable[fileorder][hs.t])[hs.b] = 1;
+            // }
+            if (hs.t >=0 && hs.t <4 && hs.t != fileorder && hs.r == FilterTable(hs.t, hs.b) && hs.r < 63){
+                (*EsTable[fileorder][hs.t])[hs.b] = 1;
             }
         }
     }
+    std::cerr << std::format("[task {}]: finished\n", fileorder);
 }
 
 template <typename FTable, typename ETable>
-void StatDepoWorker(FTable &FilterTable, ETable &EsTable, int fileorder){
-    // for(ll b=0; b<B_SIZE; b++){
+void StatDepoWorker(FTable &FilterTable, ETable &EsTable, int fileorder, ll (&bottle)[4]){
+    std::cerr << std::format("This is task: {}\n", fileorder);
+    for(ll b=0; b<B_SIZE; b++){
         //128 = 2*2*2*2*2*2*2 = 10000000 so 127 = 1111111 64=1000000 63=111111
-        FilterTable(b, fileorder) = 
-            ((ETable[0][b] + ETable[1][b] + ETable[2][b] + ETable[3][b] - ETable[fileorder][b]) << 6) | FilterTable(b, fileorder);
-    // }
+        int res = ((*EsTable[0][fileorder])[b] + (*EsTable[1][fileorder])[b] + (*EsTable[2][fileorder])[b] + (*EsTable[3][fileorder])[b]);
+        if (res) cerr << res << endl;
+        bottle[res] += 1;
+        FilterTable(fileorder, b) = (res << 6) | FilterTable(fileorder, b);
+        if (b % 1000000 == 0){
+            std::cerr << std::format("\r[task {}]: main loop time {}", fileorder, b);
+        }
+    }
+    std::cerr << std::format("\n[task {}]: finished\n", fileorder);
 }
 
 int main(int argc, char** argv){
@@ -275,7 +287,7 @@ int main(int argc, char** argv){
 
     char* FTdata = new char[16 * (B_SIZE)];
 
-    std::fill_n (FTdata, 16 * (B_SIZE), 64);
+    std::fill_n (FTdata, 16 * (B_SIZE), 63);
 
     auto FilterTable = [&](size_t i, size_t j) -> char& {
         return FTdata[i * (B_SIZE) + j];
@@ -285,9 +297,9 @@ int main(int argc, char** argv){
         std::cerr << "Testing reads\n";
 
         std::vector<std::thread> threads;
-        for (int i=0; i<17; i++){
+        for (int i=1; i<17; i++){
             std::cerr << "Initializing thread " << i << std::endl;
-            std::string fileName = std::format("sim{}.seq", i);
+            std::string fileName = std::format("simc{}.fa", i);
             threads.emplace_back(FilterInputWorker<decltype(FilterTable)>, 
                 std::ref(FilterTable), std::move(fileName), i);
         }
@@ -299,7 +311,41 @@ int main(int argc, char** argv){
 
     if(true){
         std::cerr << "Estimating...\n";
-        std::vector<std::vector<std::unique_ptr<std::bitset<N>>>> EsTable(4, std::vector<std::unique_ptr<std::bitset<B_SIZE>>>(4));
+        std::vector<std::vector<std::unique_ptr<std::bitset<B_SIZE>>>> EsTable;
+        //4*16
+        std::cerr << "Initialized ES Table\n";
+        EsTable.reserve(4);
+        for (int i = 0; i < 4; ++i) {
+            EsTable.emplace_back(4);
+        }
+
+        for (auto& innerVec : EsTable) {
+            for (auto& ptr : innerVec) {
+                ptr = std::make_unique<std::bitset<B_SIZE>>();
+            }
+        }
+        
+        std::cerr << "Adding working threads: 4 CrossStatWorkers\n";
+
+        std::thread CSW1(CrossStatWorker<decltype(FilterTable), decltype(EsTable)>, std::ref(FilterTable), std::ref(EsTable), "simc1.fa", 0);
+        std::thread CSW2(CrossStatWorker<decltype(FilterTable), decltype(EsTable)>, std::ref(FilterTable), std::ref(EsTable), "simc2.fa", 1);
+        std::thread CSW3(CrossStatWorker<decltype(FilterTable), decltype(EsTable)>, std::ref(FilterTable), std::ref(EsTable), "simc3.fa", 2);
+        std::thread CSW4(CrossStatWorker<decltype(FilterTable), decltype(EsTable)>, std::ref(FilterTable), std::ref(EsTable), "simc4.fa", 3);
+        CSW1.join(); CSW2.join(); CSW3.join(); CSW4.join();
+
+        std::cerr << "Adding working threads: 4 StatDepoWorkers\n";
+
+        ll res1[4] = {0,0,0,0}, res2[4] = {0,0,0,0}, res3[4] = {0,0,0,0}, res4[4] = {0,0,0,0};
+        std::thread SDW1(StatDepoWorker<decltype(FilterTable), decltype(EsTable)>, std::ref(FilterTable), std::ref(EsTable), 0, std::ref(res1));
+        std::thread SDW2(StatDepoWorker<decltype(FilterTable), decltype(EsTable)>, std::ref(FilterTable), std::ref(EsTable), 1, std::ref(res2));
+        std::thread SDW3(StatDepoWorker<decltype(FilterTable), decltype(EsTable)>, std::ref(FilterTable), std::ref(EsTable), 2, std::ref(res3));
+        std::thread SDW4(StatDepoWorker<decltype(FilterTable), decltype(EsTable)>, std::ref(FilterTable), std::ref(EsTable), 3, std::ref(res4));
+        SDW1.join(); SDW2.join(); SDW3.join(); SDW4.join();
+
+        std::cerr << res1[0] << ' ' << res1[1] << ' ' << res1[2] << ' ' << res1[3] << std::endl;
+        std::cerr << res2[0] << ' ' << res2[1] << ' ' << res2[2] << ' ' << res2[3] << std::endl;
+        std::cerr << res3[0] << ' ' << res3[1] << ' ' << res3[2] << ' ' << res3[3] << std::endl;
+        std::cerr << res4[0] << ' ' << res4[1] << ' ' << res4[2] << ' ' << res4[3] << std::endl;
 
     }
 
