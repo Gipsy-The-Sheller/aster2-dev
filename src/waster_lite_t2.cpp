@@ -53,7 +53,7 @@ struct BinSeq{
     template<typename T>
     char TwoBit(T address){
         // return ((this->seq[address * 2] ? 1 : 0) << 2) | (this->seq[address * 2 + 1] ? 1 : 0);
-        return 2 * seq[address * 2] + seq[address * 2 + 1];
+        return (seq[address * 2]<<1 | seq[address * 2 + 1]);
     }
 
     bool Yieldable(){
@@ -73,14 +73,14 @@ struct BinSeq{
         seqlength = sequence.size();
         for (int i=0; i < sequence.size(); i++){
 
-            switch (sequence[i]){
-                case 'a':{
+            switch (std::toupper(sequence[i])){
+                case 'A':{
                     seq[2 * i] = 0; seq[2 * i + 1] = 0; break;
-                } case 'c': {
+                } case 'C': {
                     seq[2 * i] = 0; seq[2 * i + 1] = 1; break;
-                } case 'g':{
+                } case 'G':{
                     seq[2 * i] = 1; seq[2 * i + 1] = 0; break;
-                } case 't':{
+                } case 'T':{
                     seq[2 * i] = 1; seq[2 * i + 1] = 1; break;
                 }
             }
@@ -255,9 +255,7 @@ void CrossStatWorker(FTable &FilterTable, ETable &EsTable, string fileName, int 
             HashSquare hs(n, m, EMPTY);
             
             if (hs.discard || hs.t == 16) continue;
-            // if (hs.t >=0 && hs.t <4 && hs.t != fileorder && hs.r == FilterTable(fileorder, hs.b) && hs.r < 63){
-            //     (*EsTable[fileorder][hs.t])[hs.b] = 1;
-            // }
+
             if (hs.t >=0 && hs.t <4 && hs.t != fileorder && hs.r == FilterTable(hs.t, hs.b) && hs.r < 63){
                 (*EsTable[fileorder][hs.t])[hs.b] = 1;
             }
@@ -271,8 +269,7 @@ void StatDepoWorker(FTable &FilterTable, ETable &EsTable, int fileorder, ll (&bo
     std::cerr << std::format("This is task: {}\n", fileorder);
     for(ll b=0; b<B_SIZE; b++){
         //128 = 2*2*2*2*2*2*2 = 10000000 so 127 = 1111111 64=1000000 63=111111
-        int res = ((*EsTable[0][fileorder])[b] + (*EsTable[1][fileorder])[b] + (*EsTable[2][fileorder])[b] + (*EsTable[3][fileorder])[b]);
-        if (res) cerr << res << endl;
+        int res = ((int)(*EsTable[0][fileorder])[b] + (int)(*EsTable[1][fileorder])[b] + (int)(*EsTable[2][fileorder])[b] + (int)(*EsTable[3][fileorder])[b]);
         bottle[res] += 1;
         FilterTable(fileorder, b) = (res << 6) | FilterTable(fileorder, b);
         if (b % 1000000 == 0){
@@ -301,7 +298,7 @@ int main(int argc, char** argv){
             std::cerr << "Initializing thread " << i << std::endl;
             std::string fileName = std::format("simc{}.fa", i);
             threads.emplace_back(FilterInputWorker<decltype(FilterTable)>, 
-                std::ref(FilterTable), std::move(fileName), i);
+                std::ref(FilterTable), std::move(fileName), i-1);
         }
 
         for (auto& t : threads) {
