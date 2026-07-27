@@ -30,11 +30,12 @@ constexpr int kSize = 21;
 constexpr int kFlankSize = (int)(kSize-1) / 2;
 constexpr unsigned long long B_SIZE = 1ULL<<29;
 constexpr unsigned long long BT_SIZE = B_SIZE / 8;
+constexpr unsigned long long BUFFER_SIZE = 1024 * 1024 * 64;
 constexpr char EMPTY = 0b00;
 constexpr int ALIGNMENT = 1024;
 
 using BITSET = std::bitset<B_SIZE>;
-using EsTablePtr = BITSET* (*)[3];
+using EsTablePtr = BITSET* (*)[17];
 
 // char mem[12ULL<<30];
 char* mem = nullptr;
@@ -148,11 +149,10 @@ std::pair<ll, ll> recover_n_m(ll t, ll b, ll r) {
     return {n, m};
 }
 
-// template <typename Table>
-void FilterInputWorker(char **FilterTable, string fileName, int fileorder){
+void FilterInputWorker(char **FilterTable, string fileName, int fileorder, char* fileBuffer){
     // std::cerr << "thread: " << fileorder << std::endl;
     std::cerr << std::format("[Task {}] - thread {} - initialized.\n", fileName, fileorder);
-    SeqParser* seqfile = new SeqParser(fileName);
+    SeqParser* seqfile = new SeqParser(fileName, fileBuffer);
     while (seqfile->nextSeq()) {
         BinSeq* sequence = new BinSeq(seqfile->getSeq(1)); // fix to adapt for FASTQ real files.
         ll n, m;
@@ -168,9 +168,9 @@ void FilterInputWorker(char **FilterTable, string fileName, int fileorder){
 
 }
 
-void CrossStatWorker(char **FilterTable, EsTablePtr EsTable, string fileName, int fileorder){
+void CrossStatWorker(char **FilterTable, EsTablePtr EsTable, string fileName, int fileorder, char* fileBuffer){
     std::cerr << std::format("This is task: {}\n", fileorder);
-    SeqParser* seqfile = new SeqParser(fileName);
+    SeqParser* seqfile = new SeqParser(fileName, fileBuffer);
     while (seqfile->nextSeq()) {
         BinSeq* sequence = new BinSeq(seqfile->getSeq(1));
         ll n, m;
@@ -178,28 +178,29 @@ void CrossStatWorker(char **FilterTable, EsTablePtr EsTable, string fileName, in
             std::tie(n, m) = sequence->Yield();
             HashSquare hs(n, m, EMPTY);
             if (hs.discard || hs.t == 16) continue;
-            if (hs.r == FilterTable[hs.t][hs.b] && hs.r < 63 && hs.t < 4){
-                if (EsTable[fileorder][hs.t]){
-                    (*EsTable[fileorder][hs.t])[hs.b] = 1;
-                }
+            if (hs.r == FilterTable[hs.t][hs.b] && hs.r < 63){
+                //if (hs.t - (hs.t%4) <= fileorder && hs.t + 4 - (hs.t%4) > fileorder){
+                    if (EsTable[fileorder % 4][hs.t]){
+                        (*EsTable[fileorder % 4][hs.t])[hs.b] = 1;
+                    }                    
+                //}
             }
         }
     }
     std::cerr << std::format("[task {}] finished.\n", fileorder);
 }
 
-void StatDepoWorker(char **FilterTable, EsTablePtr EsTable, int fileorder, ll (&bottle)[4]){
+void StatDepoWorker(char **FilterTable, EsTablePtr EsTable, int fileorder){
     std::cerr << std::format("This is task: {}\n", fileorder);
     for(ll b=0; b<B_SIZE; b++){
-        int res = 0;
-        for (int i=0; i<4; i++){
-            res += EsTable[i][fileorder] ? (int)(*EsTable[i][fileorder])[b] : 0;
+        if (FilterTable[fileorder][b] != 63){
+            int res = 0;
+            for (int i=0; i<4; i++){
+                res += EsTable[i][fileorder] ? (int)((*EsTable[i][fileorder])[b]) : 0;
+            }
+            FilterTable[fileorder][b] = (res << 6) | FilterTable[fileorder][b];            
         }
-        bottle[res] += 1;
-        FilterTable[fileorder][b] = (res << 6) | FilterTable[fileorder][b];
-        if (b % 1000000 == 0){
-            std::cerr << std::format("\r[task {}]: main loop time {}", fileorder, b);
-        }
+
     }
     std::cerr << std::format("\n[task {}]: finished\n", fileorder);
 }
@@ -223,6 +224,8 @@ int main(int argc, char** argv){
     
     char *memstart = mem, *memEst = &mem[4LL << 30], *memFlt = memstart;
 
+    char *bufferStart = mem + 16 * B_SIZE + 48 * BT_SIZE; // 1024 * 1024 * 64 = 64MBytes; 
+
     char *FilterTable[17];
     for (int i = 0; i < 16; i++){
         FilterTable[i] = mem + i * B_SIZE;
@@ -232,13 +235,12 @@ int main(int argc, char** argv){
 
 
     if(true){
-        std::cerr << "Testing reads\n";
 
         std::vector<std::thread> threads;
         for (int i=1; i<17; i++){
             std::string fileName = std::format("simc{}.fa", i);
             threads.emplace_back(FilterInputWorker, 
-                FilterTable, std::move(fileName), i-1);
+                FilterTable, std::move(fileName), i-1, bufferStart + (i-1) * BUFFER_SIZE);
         }
 
         for (auto& t : threads) {
@@ -275,30 +277,50 @@ int main(int argc, char** argv){
             }            
         }
         
-        std::cerr << "Adding working threads: 4 CrossStatWorkers\n";
 
-        std::thread CSW1(CrossStatWorker, FilterTable, EsTable, string("simc1.fa"), 0);
-        std::thread CSW2(CrossStatWorker, FilterTable, EsTable, string("simc2.fa"), 1);
-        std::thread CSW3(CrossStatWorker, FilterTable, EsTable, string("simc3.fa"), 2);
-        std::thread CSW4(CrossStatWorker, FilterTable, EsTable, string("simc4.fa"), 3);
+        {
+            
+            std::cerr << "Adding working threads: 16 CrossStatWorkers\n";
+            std::vector <std::thread> CSWthreads;
+            for (int i=0; i<16; i++){
+                CSWthreads.emplace_back(CrossStatWorker, FilterTable, blockEsTable, std::format("simc{}.fa", i+1), i, bufferStart + i*BUFFER_SIZE);
+            }
 
-        CSW1.join(); CSW2.join(); CSW3.join(); CSW4.join();
+            for (auto &i : CSWthreads) {
+                if (i.joinable()){
+                    i.join();
+                }
+            }            
+        }
 
-        std::cerr << "Adding working threads: 4 StatDepoWorkers\n";
+        {
+            std::cerr << "Adding working threads: 4 StatDepoWorkers\n";
+            std::vector <std::thread> SDWthreads;
+            for (int i=0; i<16; i++){
+                SDWthreads.emplace_back(StatDepoWorker, FilterTable, blockEsTable, i);
+            }
 
-        ll res1[4] = {0,0,0,0}, res2[4] = {0,0,0,0}, res3[4] = {0,0,0,0}, res4[4] = {0,0,0,0};
+            for (auto &i : SDWthreads) {
+                if (i.joinable()){
+                    i.join();
+                }
+            }            
+        }
+
+        std::cerr << "Validating results on file 0\n";
+
+        {
+            int temp_res[4] = {};
+            for (ll i=0; i<B_SIZE; i++) {
+                //char: 127 = 0b111111
+                //char: 63  = 0b011111
+                auto count = int((FilterTable[0][i] >> 6) & 0x03);
+                temp_res[count] ++ ;
+            }
+            cerr << temp_res[0] << ' ' << temp_res[1] << ' ' << temp_res[2] << ' ' << temp_res[3] << endl;
+        }
+
         
-        std::thread SDW1(StatDepoWorker, FilterTable, EsTable, 0, std::ref(res1));
-        std::thread SDW2(StatDepoWorker, FilterTable, EsTable, 1, std::ref(res2));
-        std::thread SDW3(StatDepoWorker, FilterTable, EsTable, 2, std::ref(res3));
-        std::thread SDW4(StatDepoWorker, FilterTable, EsTable, 3, std::ref(res4));
-
-        SDW1.join(); SDW2.join(); SDW3.join(); SDW4.join();
-
-        std::cerr << res1[0] << ' ' << res1[1] << ' ' << res1[2] << ' ' << res1[3] << std::endl;
-        std::cerr << res2[0] << ' ' << res2[1] << ' ' << res2[2] << ' ' << res2[3] << std::endl;
-        std::cerr << res3[0] << ' ' << res3[1] << ' ' << res3[2] << ' ' << res3[3] << std::endl;
-        std::cerr << res4[0] << ' ' << res4[1] << ' ' << res4[2] << ' ' << res4[3] << std::endl;
 
     }
 
