@@ -1,8 +1,4 @@
-#include <future>
-
 //waster-lite for menory-save waster analysis
-
-#define DEBUG
 
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +13,7 @@
 #include <cmath>
 #include <bitset>
 #include <new>
+#include <cstring>
 
 #include "sequence_utilities.hpp"
 
@@ -33,6 +30,12 @@ constexpr unsigned long long BT_SIZE = B_SIZE / 8;
 constexpr unsigned long long BUFFER_SIZE = 1024 * 1024 * 64;
 constexpr char EMPTY = 0b00;
 constexpr int ALIGNMENT = 1024;
+constexpr unsigned long long MAX_B = (((1ULL << 39) / 17 + 1) / 65 + 1);
+constexpr unsigned long long MAX_BPRIME = MAX_B / 63 + 1;
+constexpr int LMERADDIFLANK = 6;
+constexpr int FLANK_BITS = 2 * LMERADDIFLANK;        // bits per flank (6-mer = 12)
+constexpr int FLANK_MASK = (1 << FLANK_BITS) - 1;    // 0xFFF
+constexpr int LF_SHIFT   = FLANK_BITS + 2;           // lf offset in stored largeKmer (rf 12-bit + c 2-bit = 14)
 
 using BITSET = std::bitset<B_SIZE>;
 using EsTablePtr = BITSET* (*)[17];
@@ -48,6 +51,13 @@ static_assert(kFlankSize * 2 <= 64, "Sequence too long for 64-bit hash");
 
 struct HashSquare;
 struct BinSeq;
+
+struct KMerInfo {
+    short r_prime;
+    char freq;
+    bool del;
+    unsigned long long consensusL, consensusR;
+} ;
 
 struct BinSeq{
     const static int K = 10, SHIFT = 2 * (K-1);
@@ -77,6 +87,12 @@ struct BinSeq{
         return n > m ? std::make_tuple(n, m) : std::make_tuple(m, n);
     }
 
+    inline void YieldInit() {
+        for (char i = 0 ; i < K - 1; i++){
+            Yield();
+        }        
+    }
+
     BinSeq(const string& sequence) {
         seqlength = sequence.size();
         for (int i=0; i < sequence.size(); i++){
@@ -93,17 +109,49 @@ struct BinSeq{
                 }
             }
         }
-        for (char i = 0 ; i < K - 1; i++){
-            Yield();
-        }
+
+        YieldInit();
     }
+};
+
+struct LargeBinSeq : BinSeq {
+    const static int ADDIFLANK = LMERADDIFLANK;
+    const static int ADDISHIFT = (ADDIFLANK + 1) * 2;
+    const static int ADDIMASK  = (1 << ADDISHIFT) - 1;
+    int lf = 0, rf = 0;
+
+    inline void YieldInit() {
+        for (char i = 0 ; i < K + ADDIFLANK - 1; i++){
+            YieldFlanks();
+        }         
+    }
+
+    bool Yieldable () {
+        return count + K + ADDIFLANK > seqlength ? false : true; 
+    }
+
+    tuple<int, int, int, int, int> YieldFlanks(){
+        // return n, m for core 21-mers, and n, m for additional 5+5 flanks
+
+        n = ((n & MASK) << 2) | TwoBit(count);
+        m = (m >> 2) | ((3u ^ TwoBit(count + K + 1)) << SHIFT);
+        lf = ((lf & ((1 << (2*(ADDIFLANK-1))) - 1)) << 2) | TwoBit(count - K + 1);
+        // rf = ((rf & ((1 << (2*(ADDIFLANK-1))) - 1)) << 2) | TwoBit(count + ADDIFLANK + 1);
+        rf = ((rf & ((1 << (2*(ADDIFLANK-1))) - 1)) << 2) | ((3u ^ TwoBit(count + K + 1 + ADDIFLANK)) << (2*(ADDIFLANK-1)));
+        
+        count ++;
+        return n > m ? std::make_tuple(n, m, lf, rf, (int)TwoBit(count+1)) : std::make_tuple(m, n, rf, lf, (int)(3-TwoBit(count+1)));
+    }
+
+    LargeBinSeq(const string& sequence): BinSeq(sequence) { }
 };
 
 struct HashSquare {
     ll n, m, c;
     ll k, v, t, b, r;
     bool reverse, discard;
-    ll AdjustedFlankHash, AdjustedCoreHash; 
+    ll AdjustedFlankHash, AdjustedCoreHash;
+    ll b_prime, r_prime; 
 
     template <typename T>
     T RevCompHash(T x) {
@@ -130,7 +178,9 @@ struct HashSquare {
             v = k / 17;
             t = k % 17;
             b = v / 65;
-            r = v % 65;         
+            r = v % 65;      
+            b_prime = b / 63;
+            r_prime = (b % 63) * 65 + r;
         }
 
     }
@@ -147,6 +197,24 @@ std::pair<ll, ll> recover_n_m(ll t, ll b, ll r) {
     ll n = lo;
     ll m = k - n * (n - 1) / 2;
     return {n, m};
+}
+
+inline int seqdiff(int largeKmer, int lf, int rf) {
+    int c_old = largeKmer & 0x3;
+    int rf_old = (largeKmer >> 2) & FLANK_MASK;
+    int lf_old = (largeKmer >> LF_SHIFT) & FLANK_MASK;
+    
+    int diff = 0;
+    for (int i = 0; i < LMERADDIFLANK; ++i) {
+        int base_lf_new = (lf >> (2 * i)) & 0x3;
+        int base_lf_old = (lf_old >> (2 * i)) & 0x3;
+        if (base_lf_new != base_lf_old) diff++;
+        
+        int base_rf_new = (rf >> (2 * i)) & 0x3;
+        int base_rf_old = (rf_old >> (2 * i)) & 0x3;
+        if (base_rf_new != base_rf_old) diff++;
+    }
+    return diff;
 }
 
 void FilterInputWorker(char **FilterTable, string fileName, int fileorder, char* fileBuffer){
@@ -192,7 +260,7 @@ void CrossStatWorker(char **FilterTable, EsTablePtr EsTable, string fileName, in
 
 void StatDepoWorker(char **FilterTable, EsTablePtr EsTable, int fileorder){
     std::cerr << std::format("This is task: {}\n", fileorder);
-    for(ll b=0; b<B_SIZE; b++){
+    for(ll b=0; b < MAX_B; b++){
         if (FilterTable[fileorder][b] != 63){
             int res = 0;
             for (int i=0; i<4; i++){
@@ -205,6 +273,68 @@ void StatDepoWorker(char **FilterTable, EsTablePtr EsTable, int fileorder){
     std::cerr << std::format("\n[task {}]: finished\n", fileorder);
 }
 
+void BuildKmerInfo (char **FilterTable, KMerInfo (*kmerinfo)[16][8 << 20]) {
+    struct Temp {
+        ll t, b, r, b_prime, r_prime;
+        short sum;
+        Temp (ll _t, ll _b, ll _r, short _sum): t(_t), b(_b), r(_r), sum(_sum) {
+            b_prime = b / 63;
+            r_prime = (b % 63) * 65 + r;
+        }
+    } temp (0,0,0,-1);
+    // temp.sum = -1;
+    short count = 0;
+    for (ll b = 0; b < MAX_B; b ++) {
+        for (short t = 0; t < 16; t++) {
+            if (FilterTable[t][b] < 63) {
+                auto sum = int((FilterTable[t][b] >> 6) & 0x03);
+                if (sum > temp.sum){
+                    ll r = (unsigned char)FilterTable[t][b] & 0x3F;
+                    temp = Temp (t, b, r, sum);
+                }
+            } 
+        }
+        count ++;
+        if (count % 63 == 0){
+            count = 0;
+            
+            if (temp.sum >= 0){
+                (*kmerinfo)[temp.t][temp.b_prime].r_prime = temp.r_prime;
+            } else {
+                (*kmerinfo)[temp.t][temp.b_prime].r_prime = (short)NULL;
+            }
+            temp.sum = -1;
+        }
+    }
+}
+
+void CallLargeMers(int (*largeKmer)[16][8<<20], KMerInfo (*kmerinfo)[16][8 << 20], string fileName, int fileorder, char* fileBuffer) {
+    cerr << std::format("[Task {}] Initializing...\n", fileName);
+
+    SeqParser* seqfile = new SeqParser(fileName, fileBuffer);
+
+
+    while (seqfile->nextSeq()) {
+        LargeBinSeq* sequence = new LargeBinSeq(seqfile->getSeq(1)); // fix to adapt for FASTQ real files.
+        ll n, m, lf, rf, c;
+        while(sequence->Yieldable()){
+            std::tie(n, m, lf, rf, c) = sequence->YieldFlanks();
+            HashSquare hs(n, m, EMPTY);
+
+            if (hs.t >= 16) {
+                continue;
+            }
+            if ((*kmerinfo)[hs.t][hs.b_prime].r_prime == hs.r_prime) {
+                if (largeKmer[fileorder][hs.t][hs.b_prime] == -1) {
+                    largeKmer[fileorder][hs.t][hs.b_prime] = ((lf << LF_SHIFT) | (rf << 2) | c);
+                } else if (seqdiff(largeKmer[fileorder][hs.t][hs.b_prime], lf, rf) > 1 || (largeKmer[fileorder][hs.t][hs.b_prime] &0x3) != c) {
+                    largeKmer[fileorder][hs.t][hs.b_prime] = -2;
+                }
+            }
+        }
+    }
+    std::cerr << std::format("[Task {}] finished.\n", fileName);
+}
 // struct WorkFlowc {
 //     WorkFlow {
 
@@ -212,6 +342,31 @@ void StatDepoWorker(char **FilterTable, EsTablePtr EsTable, int fileorder){
 
 
 // }
+
+std::string full_length_int_2_mer(int val) {
+    static const char base[4] = {'A', 'C', 'G', 'T'};
+    std::string result;
+    result.reserve(16);
+    // 从最高位（bit 31-30）到最低位（bit 1-0），共16个碱基
+    for (int i = 15; i >= 0; --i) {
+        int idx = (val >> (2 * i)) & 0x3;
+        result.push_back(base[idx]);
+    }
+    return result;
+}
+
+std::string encode_int32_to_10mer(int val) {
+    // static const char base[4] = {'A', 'C', 'G', 'T'};
+    // uint32_t uval = static_cast<uint32_t>(val) & 0xFFFFF; // 保留低20位
+    // std::string result;
+    // result.reserve(10);
+    // for (int i = 9; i >= 0; --i) {          // 从第19-18位开始
+    //     int idx = (uval >> (2 * i)) & 0x3;
+    //     result.push_back(base[idx]);
+    // }
+    // return result;
+    return full_length_int_2_mer(val);
+}
 
 int main(int argc, char** argv){
     mem = static_cast<char*>(::operator new(MEM_SIZE, std::align_val_t(ALIGNMENT)));
@@ -222,6 +377,8 @@ int main(int argc, char** argv){
     }
 
     
+    // FilterTable         buffer
+    //|----8GB----|--3GB--|-1GB-|
     char *memstart = mem, *memEst = &mem[4LL << 30], *memFlt = memstart;
 
     char *bufferStart = mem + 16 * B_SIZE + 48 * BT_SIZE; // 1024 * 1024 * 64 = 64MBytes; 
@@ -248,6 +405,8 @@ int main(int argc, char** argv){
         }
     }
 
+    // FilterTable EsTable buffer
+    //|----8GB----|--3GB--|-1GB-|
     char *EsStart = mem + 16 * B_SIZE;
     BITSET *EsTable[16][3] = {};
     for (int i = 0; i < 16; i++){
@@ -307,21 +466,93 @@ int main(int argc, char** argv){
             }            
         }
 
-        std::cerr << "Validating results on file 0\n";
-
+        // FilterTable kMerInfo buffer
+        //|----8GB----|--3GB--|-1GB-|
+        KMerInfo (*kMerInfoTable)[16][8 << 20] = reinterpret_cast<KMerInfo (*)[16][8 << 20]>(EsStart);
         {
-            int temp_res[4] = {};
-            for (ll i=0; i<B_SIZE; i++) {
-                //char: 127 = 0b111111
-                //char: 63  = 0b011111
-                auto count = int((FilterTable[0][i] >> 6) & 0x03);
-                temp_res[count] ++ ;
-            }
-            cerr << temp_res[0] << ' ' << temp_res[1] << ' ' << temp_res[2] << ' ' << temp_res[3] << endl;
+            std::cerr << "Compressing Filtertable...\n";
+            
+            memset(kMerInfoTable, 0, sizeof(*kMerInfoTable));
+
+            BuildKmerInfo(FilterTable, kMerInfoTable);
+            std::cerr <<"finished.\n";      
+        }
+        
+        // int (*largeKmer)[16][16][8<<20] = (int (*)[16][16][8<<20]) memstart;
+        int (*largeKmer)[16][8<<20] = new (memstart) int[16][16][8<<20];
+        memset(largeKmer, -1, (16ULL * 16 * (8 << 20) * sizeof(int)));
+
+        cerr << largeKmer << endl;
+
+        std::cerr << "Adding working threads: 16 RecallLMWorkers\n";
+
+        // CallLargeMers(largeKmer, kMerInfoTable, std::format("simc{}.fa", 1), 0, bufferStart);
+        std::vector <std::thread> RCLthreads;
+        for (int i=0; i<16; i++){
+            RCLthreads.emplace_back(CallLargeMers, largeKmer, kMerInfoTable, std::format("simc{}.fa", i+1), i, bufferStart + i*BUFFER_SIZE);
         }
 
+        for (auto &i : RCLthreads){
+            i.join();
+        }
         
+        for (int t=0; t < 16; t++) {
+            for (int b_prime = 0; b_prime < MAX_BPRIME; b_prime++) {
+                if ((*kMerInfoTable)[t][b_prime].r_prime){
+                    int multihits = 0;
+                    std::vector<int> profile;
 
+                    // summarize all flank info and form a profile
+                    for (int f=0; f<16; f++){
+                        switch(largeKmer[f][t][b_prime]){
+                            case -1: continue; break;
+                            case -2: multihits ++; break;
+                            default: profile.push_back((largeKmer[f][t][b_prime])); (*kMerInfoTable)[t][b_prime].freq++;
+                        }
+                        if (multihits > 1) {(*kMerInfoTable)[t][b_prime].del = true; break;}
+                    }
+
+                    if (!(*kMerInfoTable)[t][b_prime].del) {
+                        for (auto i : profile) {
+                            cerr << "[profile]  " << encode_int32_to_10mer(i)  << " - raw - " << std::bitset<32>(i) << endl;
+                        }
+
+                        int left_freq[LMERADDIFLANK][4] = {{0}};  
+                        int right_freq[LMERADDIFLANK][4] = {{0}}; 
+                        for (auto j : profile) {
+                            int lf_part = (j >> LF_SHIFT) & FLANK_MASK;  
+                            int rf_part = (j >> 2) & FLANK_MASK; 
+                            for (int pos = 0; pos < LMERADDIFLANK; ++pos) {
+                                int base_l = (lf_part >> (2 * (LMERADDIFLANK - 1 - pos))) & 0x3;  
+                                int base_r = (rf_part >> (2 * (LMERADDIFLANK - 1 - pos))) & 0x3;
+                                left_freq[pos][base_l]++;
+                                right_freq[pos][base_r]++;
+                            }
+                        }
+
+                        // -2, 6-mer
+                        int consensusL = 0;
+                        for (int pos = 0; pos < LMERADDIFLANK; ++pos) {
+                            int max_idx = std::max_element(left_freq[pos], left_freq[pos] + 4) - left_freq[pos];
+                            consensusL = (consensusL << 2) | (max_idx & 0x3);
+                        }
+
+                        int consensusR = 0;
+                        for (int pos = 0; pos < LMERADDIFLANK; ++pos) {
+                            int max_idx = std::max_element(right_freq[pos], right_freq[pos] + 4) - right_freq[pos];
+                            consensusR = (consensusR << 2) | (max_idx & 0x3);
+                        }
+
+                        cerr << "[consensusL] " << encode_int32_to_10mer(consensusL) << endl;
+                        cerr << "[consensusR] " << encode_int32_to_10mer(consensusR) << endl;
+
+                        // depo
+                        (*kMerInfoTable)[t][b_prime].consensusL = consensusL;
+                        (*kMerInfoTable)[t][b_prime].consensusR = consensusR;
+                    }
+                }
+            }
+        }
     }
 
     std::cerr << "Finished";
