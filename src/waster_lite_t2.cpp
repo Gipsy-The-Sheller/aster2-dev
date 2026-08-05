@@ -186,6 +186,72 @@ struct HashSquare {
     }
 };
 
+struct Trie {
+    static const int TRIEDEPTH = kFlankSize + LMERADDIFLANK;
+    static constexpr size_t NODE_SIZE = sizeof(struct Node);
+    static constexpr capacity = 8ULL << 30;
+    
+    struct Node {
+        Node *parent;
+        Node *(children[4]) = {nullptr, nullptr, nullptr, nullptr};
+        std::bitset<2> label;
+
+        Node (Node *parent = NULL, std::bitset<2> label = 0b00) {
+            if (parent) {
+                if (parent->children[(int)label]) {
+                    throw std::format("[TRIE-NODE] The node is already initialized!");
+                }
+                parent->children[(int)label] = this;
+            }
+        }
+
+    };
+
+    char* memory;
+    int used;
+
+    // std::vector<Node> pool; //alloc
+
+    Node* allocate_node() {
+        if (used + NODE_SIZE > capacity) throw std::bad_alloc();
+        Node* ptr = reinterpret_cast<Node*>(memory + used);
+        used += NODE_SIZE;
+        return ptr;
+    }
+
+    Node* push(Node *parent, std::bitset<2> label){
+        if (parent->children[(int)label]) return parent->children[(int)label];
+        else {
+            Node* new_node = ::new (allocate_node()) Node(parent, label); 
+            return new_node;
+        }
+    }
+
+    void add(uint32_t mer) {
+        //reverse complement
+        auto nextptr = root;
+        for (int i=0; i < TRIEDEPTH; i++){
+            std::bitset<2> rcnewbase;
+            {
+                std::bitset<2> newbase = mer & 0b11;
+                rcnewbase = std::bitset<2>(0b11 - newbase.to_ulong());
+                mer = mer >> 2;
+            }
+            nextptr = push(nextptr, rcnewbase);
+        }
+    }
+
+    Trie(char* mem): memory(mem) {
+        this->pool.emplace_back(nullptr, 0);
+        root = &pool.back();
+    }
+
+    // for 16-mers, the maximum summary of nodes is:
+    // 4^16 + 4^15 + ... + 4 = 4 (4^16 - 1) / (4-1) ~ 4^16 = 2^32 = ((2^10)^3) * 2^2 ~ 3GB * 4 = 12GB ?! 
+
+    // for total kmers (128MB * 16bp), maximum: 492,131,669 nodes, each with 2 pointer
+};
+
 std::pair<ll, ll> recover_n_m(ll t, ll b, ll r) {
     ll k = (b * 65 + r) * 17 + t;
     ll lo = 0, hi = (1LL << 20);
@@ -197,6 +263,14 @@ std::pair<ll, ll> recover_n_m(ll t, ll b, ll r) {
     ll n = lo;
     ll m = k - n * (n - 1) / 2;
     return {n, m};
+}
+
+// recover the canonical core flank pair {n = larger, m = smaller} from the packed
+// table coords. inverse of HashSquare: b_prime = b/63, r_prime = (b%63)*65 + r.
+std::pair<ll, ll> recover_n_m_prime(ll t, ll b_prime, ll r_prime) {
+    ll b = b_prime * 63 + r_prime / 65;   // undo b_prime = b/63
+    ll r = r_prime % 65;                  // undo r_prime = (b%63)*65 + r
+    return recover_n_m(t, b, r);
 }
 
 inline int seqdiff(int largeKmer, int lf, int rf) {
@@ -546,9 +620,19 @@ int main(int argc, char** argv){
                         cerr << "[consensusL] " << encode_int32_to_10mer(consensusL) << endl;
                         cerr << "[consensusR] " << encode_int32_to_10mer(consensusR) << endl;
 
-                        // depo
-                        (*kMerInfoTable)[t][b_prime].consensusL = consensusL;
-                        (*kMerInfoTable)[t][b_prime].consensusR = consensusR;
+                        // depo: store the COMPLETE 16-mer flank into consensusL/R.
+                        //   consensusL/R now hold [outer 6-mer | core 10-mer] (32 bits);
+                        //   the bare 6-mer consensus is still recoverable as (val >> 20).
+                        // core 10-mers (n = larger, paired with L; m = smaller, paired with R)
+                        // are recovered from the table coords (t, b_prime, r_prime).
+                        auto [n_rec, m_rec] = recover_n_m_prime(t, b_prime, (*kMerInfoTable)[t][b_prime].r_prime);
+                        // fullL = [consensusL(6) | n(10)]   forward strand, outer -> core
+                        // fullR = [m(10) | consensusR(6)]   revcomp strand, core -> outer
+                        (*kMerInfoTable)[t][b_prime].consensusL = ((unsigned long long)consensusL << 20) | (unsigned long long)n_rec;
+                        (*kMerInfoTable)[t][b_prime].consensusR = ((unsigned long long)m_rec << 12) | (unsigned long long)consensusR;
+
+                        cerr << "[fullL] " << full_length_int_2_mer((int)(*kMerInfoTable)[t][b_prime].consensusL) << endl;
+                        cerr << "[fullR] " << full_length_int_2_mer((int)(*kMerInfoTable)[t][b_prime].consensusR) << endl;
                     }
                 }
             }
