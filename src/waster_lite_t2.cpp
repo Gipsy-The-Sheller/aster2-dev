@@ -14,6 +14,7 @@
 #include <bitset>
 #include <new>
 #include <cstring>
+#include <cstdint>
 
 #include "sequence_utilities.hpp"
 
@@ -146,6 +147,21 @@ struct LargeBinSeq : BinSeq {
     LargeBinSeq(const string& sequence): BinSeq(sequence) { }
 };
 
+struct TrieBinSeq : BinSeq {
+    inline void YieldInit() { }
+
+    bool Yieldable() {
+        return count < seqlength ? true : false; 
+    }
+
+    char SingleYield() {
+        count++;
+        return TwoBit(count-1);
+    }
+
+    TrieBinSeq(const string& sequence): BinSeq(sequence) { }
+}
+
 struct HashSquare {
     ll n, m, c;
     ll k, v, t, b, r;
@@ -154,7 +170,7 @@ struct HashSquare {
     ll b_prime, r_prime; 
 
     template <typename T>
-    T RevCompHash(T x) {
+    static T RevCompHash(T x) {
         constexpr int effective_bits = 2 * kFlankSize;  // 20
         constexpr int pairs = effective_bits / 2;        // 10
         T result = 0;
@@ -187,30 +203,43 @@ struct HashSquare {
 };
 
 struct Trie {
-    static const int TRIEDEPTH = kFlankSize + LMERADDIFLANK;
-    static constexpr size_t NODE_SIZE = sizeof(struct Node);
-    static constexpr capacity = 8ULL << 30;
-    
+    static const int TRIEDEPTH = kFlankSize + LMERADDIFLANK;   // 16
+    static constexpr unsigned long long capacity = 8ULL << 30; // 8 GB arena
+
+    // A node is either:
+    //   - internal: children[] hold real child pointers, is_tip == 0; or
+    //   - a tip:    children[0] holds a KMerInfo* (back-pointer to the source kmer),
+    //               is_tip == 1 (left / fullL flank) or 2 (right / fullR flank).
+    // A tip stands for the whole remaining suffix of a flank WITHOUT materialising it;
+    // it is expanded on demand by extend() when a second flank walks into it.
     struct Node {
-        Node *parent;
-        Node *(children[4]) = {nullptr, nullptr, nullptr, nullptr};
-        std::bitset<2> label;
+        Node *parent = nullptr;
+        Node *fail = nullptr;
+        Node *children[4] = {nullptr, nullptr, nullptr, nullptr};
+        std::bitset<2> label = 0;       // edge base (0..3) leading into this node
+        std::bitset<2> is_tip = 0;      // 0 = internal; 1 = tip (left); 2 = tip (right)
 
-        Node (Node *parent = NULL, std::bitset<2> label = 0b00) {
-            if (parent) {
-                if (parent->children[(int)label]) {
-                    throw std::format("[TRIE-NODE] The node is already initialized!");
-                }
-                parent->children[(int)label] = this;
-            }
+        Node(Node *p = nullptr, std::bitset<2> lbl = 0b00) : parent(p), label(lbl) {
+            if (parent) parent->children[label.to_ulong()] = this;
         }
-
     };
 
-    char* memory;
-    int used;
+    static constexpr size_t NODE_SIZE = sizeof(Node);
 
-    // std::vector<Node> pool; //alloc
+    /*
+    strategy (lazy / compacted trie over 16-mer flanks):
+    - inserting a flank walks RC(low-bit-first) down the trie; where it diverges from
+      existing structure it drops a *tip* (children[0] = KMerInfo*, is_tip = direction)
+      instead of allocating the rest of the path.
+    - when a later flank walks INTO a tip, extend() materialises one level of the mounted
+      flank (read from KMerInfo.consensusL / consensusR, which hold the full 16-mer),
+      pushing the tip one level deeper; repeat until the two flanks diverge or reach
+      depth 16.  ("recover the mounted kmer ... extend ... judge conflicts")
+    */
+
+    char* memory;
+    size_t used = 0;
+    Node* root = nullptr;
 
     Node* allocate_node() {
         if (used + NODE_SIZE > capacity) throw std::bad_alloc();
@@ -219,38 +248,178 @@ struct Trie {
         return ptr;
     }
 
-    Node* push(Node *parent, std::bitset<2> label){
-        if (parent->children[(int)label]) return parent->children[(int)label];
-        else {
-            Node* new_node = ::new (allocate_node()) Node(parent, label); 
-            return new_node;
-        }
+    void mountMerPtr(Node* node, KMerInfo* merptr, short direction) {
+        node->is_tip = std::bitset<2>(direction); // 0: internal node; 1: left; 2: right
+        node->children[0] = reinterpret_cast<Node*>(merptr);
     }
 
-    void add(uint32_t mer) {
-        //reverse complement
-        auto nextptr = root;
-        for (int i=0; i < TRIEDEPTH; i++){
-            std::bitset<2> rcnewbase;
-            {
-                std::bitset<2> newbase = mer & 0b11;
-                rcnewbase = std::bitset<2>(0b11 - newbase.to_ulong());
-                mer = mer >> 2;
+    // turn a tip node into an internal node by materialising the next base of its
+    // mounted flank; the mounted flank itself moves one level deeper as a fresh tip.
+    void extend(Node* node, int depth) {
+        KMerInfo* mounted = reinterpret_cast<KMerInfo*>(node->children[0]);
+        short dir = (short)node->is_tip.to_ulong();                 // 1 or 2
+        uint32_t M = (uint32_t)(dir == 1 ? mounted->consensusL : mounted->consensusR);
+        int label = 3 - (int)((M >> (2 * depth)) & 0b11);           // RC of this depth's base
+        node->children[0] = nullptr;                                // clear the merptr slot
+        node->is_tip = 0;                                           // node becomes internal
+        Node* child = ::new (allocate_node()) Node(node, std::bitset<2>(label));
+        child->is_tip = std::bitset<2>(dir);                        // mounted flank continues as a tip
+        child->children[0] = reinterpret_cast<Node*>(mounted);
+    }
+
+    void add(uint32_t mer, KMerInfo* merptr, short direction) {
+        Node* cur = root;
+        for (int depth = 0; depth < TRIEDEPTH; depth++) {
+            int label = 3 - (int)(mer & 0b11);   // RC of current low 2 bits
+            mer >>= 2;
+            if (cur->is_tip.any()) extend(cur, depth);      // lazily open the tip before descending
+            if (cur->children[label]) {
+                cur = cur->children[label];                 // shared edge: go deeper
+            } else {
+                // diverges here: drop a tip for the rest of this flank and stop
+                Node* child = ::new (allocate_node()) Node(cur, std::bitset<2>(label));
+                mountMerPtr(child, merptr, direction);
+                return;
             }
-            nextptr = push(nextptr, rcnewbase);
+        }
+        // all 16 levels matched existing edges -> identical flank already indexed; (re)mount at leaf
+        mountMerPtr(cur, merptr, direction);
+    }
+
+    // // query: return the indexed KMerInfo* if `mer` is present, else nullptr.
+    // KMerInfo* find(uint32_t mer) const {
+    //     Node* cur = root;
+    //     for (int depth = 0; depth < TRIEDEPTH; depth++) {
+    //         if (cur->is_tip.any()) {
+    //             // tip holds a full flank; the top `depth` bases already match the path,
+    //             // so only the remaining suffix needs comparing (mer has been shifted `depth` times).
+    //             KMerInfo* mounted = reinterpret_cast<KMerInfo*>(cur->children[0]);
+    //             short dir = (short)cur->is_tip.to_ulong();
+    //             uint32_t M = (uint32_t)(dir == 1 ? mounted->consensusL : mounted->consensusR);
+    //             return ((M >> (2 * depth)) == mer) ? mounted : nullptr;
+    //         }
+    //         int label = 3 - (int)(mer & 0b11);
+    //         mer >>= 2;
+    //         cur = cur->children[label];
+    //         if (!cur) return nullptr;
+    //     }
+    //     // descended all 16 levels on existing edges -> cur is the leaf tip
+    //     return cur->is_tip.any() ? reinterpret_cast<KMerInfo*>(cur->children[0]) : nullptr;
+    // }
+
+    void init_fails() {
+        std::deque<Node*> queue;
+        queue.push(root);
+
+        while(!queue.empty()) {
+            auto current = queue.front();
+            queue.pop();
+
+            if (current->parent == root) {
+                current->fail = root;
+            } else {
+                current->fail = current->parent->fail->children[current->label.to_ulong()] ? current->parent->fail->children[current->label.to_ulong()] : root;
+            }
+
+            if (!current->is_tip) {
+                for (auto i : current->children) {
+                    if (i) queue.push(i);
+                }
+            }
         }
     }
 
-    Trie(char* mem): memory(mem) {
-        this->pool.emplace_back(nullptr, 0);
-        root = &pool.back();
+    Trie(char* mem) : memory(mem), used(0) {
+        root = ::new (allocate_node()) Node(nullptr, std::bitset<2>(0));
     }
 
     // for 16-mers, the maximum summary of nodes is:
-    // 4^16 + 4^15 + ... + 4 = 4 (4^16 - 1) / (4-1) ~ 4^16 = 2^32 = ((2^10)^3) * 2^2 ~ 3GB * 4 = 12GB ?! 
+    // 4^16 + 4^15 + ... + 4 = 4 (4^16 - 1) / (4-1) ~ 4^16 = 2^32 = ((2^10)^3) * 2^2 ~ 3GB * 4 = 12GB ?!
 
     // for total kmers (128MB * 16bp), maximum: 492,131,669 nodes, each with 2 pointer
 };
+
+void BuildTrie(Trie* trie, KMerInfo (*kMerInfoTable)[16][8 << 20]) {
+    for (int t = 0; t < 16; t++) {
+        for (ll bp = 0; bp < (ll)MAX_BPRIME; bp++) {
+            KMerInfo& info = (*kMerInfoTable)[t][bp];
+            if (!info.r_prime || info.del) continue;
+            auto conL = info.consensusL, conR = HashSquare.RevCompHash<int>(info.consensusR);
+            trie->add(conL, &info, 1);
+            trie->add(conR, &info, 2);
+        }
+    }
+}
+
+class MerQuery {
+    // mismatch-tolerate kmer query (1 multihit)
+    Trie *trie;
+    string filename;
+    SeqParser* seqfile;
+
+    char CallSNP () {
+        //return SNP
+    }    
+
+    void MerMatch (Trie::Node* node, short lastmismatch = -1) {
+        if (node->is_tip.to_ulong()) {
+            // precised match
+            return;
+        }
+
+        //process current node
+        
+        if () {
+            // failed to match
+            return;
+        }
+
+        for (auto i : node->children) {
+
+        }
+    }
+
+public:
+    MerQuery (Trie *_trie, string _filename, char* buffer): trie(_trie), filename(_filename) {
+        seqfile = new SeqParser(filename, buffer);
+        while (seqfile->nextSeq()) {
+            BinSeq* sequence = new TrieBinSeq(seqfile->getSeq(1));
+            ll n, m;
+            while(sequence->Yieldable()){
+                auto bit = sequence->SingleYield();
+            }
+        }
+    }
+}
+
+    // mismatch-tolerate kmer query (1 multihit)
+
+// void BuildTrie(Trie* trie, KMerInfo (*kMerInfoTable)[16][8 << 20]) {
+//     ll sites = 0;
+//     for (int t = 0; t < 16; t++) {
+//         for (ll bp = 0; bp < (ll)MAX_BPRIME; bp++) {
+//             KMerInfo& info = (*kMerInfoTable)[t][bp];
+//             if (!info.r_prime || info.del) continue;
+//             uint32_t fullL = (uint32_t)info.consensusL;     // [lf6 | n_rec]
+//             uint32_t fullR = (uint32_t)info.consensusR;     // [m_rec | rf6]
+//             uint32_t n_rec = fullL & 0xFFFFF, lf6 = (fullL >> 20) & 0xFFF;
+//             uint32_t m_rec = (fullR >> 12) & 0xFFFFF, rf6 = fullR & 0xFFF;
+//             uint32_t flank5p, flank3p;                       // forward biological 5'/3' 16-mers
+//             if (info.reverse) {          // n_rec=SeqHash(nMer); m_rec=SeqHash(RC(mMer)); lf6=lf; rf6=RC(rf)
+//                 flank5p = (lf6 << 20) | n_rec;
+//                 flank3p = (rc_n(m_rec, 10) << 12) | rc_n(rf6, 6);
+//             } else {                     // m_rec=SeqHash(nMer); n_rec=SeqHash(RC(mMer)); rf6=lf; lf6=RC(rf)
+//                 flank5p = (rf6 << 20) | m_rec;
+//                 flank3p = (rc_n(n_rec, 10) << 12) | rc_n(lf6, 6);
+//             }
+//             trie->add(flank3p, &info, 1);            // 3' flank forward: allele = read[i-16]
+//             trie->add(rc_n(flank5p, 16), &info, 2);  // RC(5' flank):      allele = comp(read[i-16])
+//             sites++;
+//         }
+//     }
+//     std::cerr << std::format("[BuildTrie] indexed {} sites (2 patterns each), ~{} nodes used\n",
+//                              sites, trie->used / Trie::NODE_SIZE);
+// }
 
 std::pair<ll, ll> recover_n_m(ll t, ll b, ll r) {
     ll k = (b * 65 + r) * 17 + t;
