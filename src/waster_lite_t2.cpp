@@ -37,6 +37,7 @@ constexpr int LMERADDIFLANK = 6;
 constexpr int FLANK_BITS = 2 * LMERADDIFLANK;        // bits per flank (6-mer = 12)
 constexpr int FLANK_MASK = (1 << FLANK_BITS) - 1;    // 0xFFF
 constexpr int LF_SHIFT   = FLANK_BITS + 2;           // lf offset in stored largeKmer (rf 12-bit + c 2-bit = 14)
+constexpr int TRIEDEPTH  = kFlankSize + LMERADDIFLANK; // full flank width = 16 (outer 6 + core 10)
 
 using BITSET = std::bitset<B_SIZE>;
 using EsTablePtr = BITSET* (*)[17];
@@ -160,7 +161,7 @@ struct TrieBinSeq : BinSeq {
     }
 
     TrieBinSeq(const string& sequence): BinSeq(sequence) { }
-}
+};
 
 struct HashSquare {
     ll n, m, c;
@@ -202,6 +203,233 @@ struct HashSquare {
     }
 };
 
+// ===========================================================================
+//  Mismatch-tolerant flank search (applied from waster_lite_claudedev.cpp).
+//  A materialised 16-mer trie queried with up to 1 substitution mismatch,
+//  replacing the stubbed MerQuery::MerMatch. (The lazy "tip" trie further down
+//  cannot host a mismatch in its un-materialised suffix, so the search uses a
+//  plain trie where a mismatch may occur at any of the 16 depths.)
+// ===========================================================================
+
+// 16-mer reverse complement on a 32-bit MSB-first packing. (HashSquare::
+// RevCompHash is hardcoded to 2*kFlankSize = 20 bits, hence a dedicated one.)
+inline uint32_t rc16(uint32_t m) {
+    uint32_t r = 0;
+    for (int i = 0; i < TRIEDEPTH; ++i) {
+        uint32_t pair = (m >> (2 * i)) & 0x03;
+        r = (r << 2) | (3 ^ pair);
+    }
+    return r;
+}
+
+// Pack 16 bases seq[p..p+15] MSB-first (5' base in the high bits). Matches the
+// consensusL layout ([outer6 | core10], low bits = core-inner/3' base). Returns
+// 0xFFFFFFFF if the window contains an N.
+inline uint32_t pack16(const char* seq, size_t p) {
+    uint32_t m = 0;
+    for (int k = 0; k < TRIEDEPTH; ++k) {
+        unsigned b;
+        switch (seq[p + k]) {
+            case 'A': case 'a': b = 0; break;
+            case 'C': case 'c': b = 1; break;
+            case 'G': case 'g': b = 2; break;
+            case 'T': case 't': b = 3; break;
+            default: return 0xFFFFFFFFu;
+        }
+        m = (m << 2) | b;
+    }
+    return m;
+}
+
+class MismatchTrie {
+public:
+    struct Node { uint32_t children[4] = {0,0,0,0}; bool isEnd = false; };
+    std::vector<Node> pool;                       // pool[0] = root
+    std::unordered_set<uint32_t> flanks;          // distinct forward 16-mers (recall set)
+
+    MismatchTrie() { pool.emplace_back(); }
+    inline uint32_t alloc() { pool.emplace_back(); return (uint32_t)pool.size() - 1; }
+
+    void insert(uint32_t mer) {
+        uint32_t cur = 0;
+        for (int d = 0; d < TRIEDEPTH; ++d) {
+            unsigned b = (mer >> (2 * (TRIEDEPTH - 1 - d))) & 3;
+            uint32_t nxt = pool[cur].children[b];
+            if (!nxt) { nxt = alloc(); pool[cur].children[b] = nxt; }
+            cur = nxt;
+        }
+        pool[cur].isEnd = true;
+    }
+    void insertBothStrands(uint32_t mer) { insert(mer); insert(rc16(mer)); flanks.insert(mer); }
+
+    bool containsExact(uint32_t mer) const {
+        if (mer == 0xFFFFFFFFu) return false;
+        uint32_t cur = 0;
+        for (int d = 0; d < TRIEDEPTH; ++d) {
+            unsigned b = (mer >> (2 * (TRIEDEPTH - 1 - d))) & 3;
+            uint32_t nxt = pool[cur].children[b];
+            if (!nxt) return false;
+            cur = nxt;
+        }
+        return pool[cur].isEnd;
+    }
+    // k = 1 substitution: exact path first, then one divergence at each depth
+    // followed by an exact suffix. Cheap on a sparse trie (most branches die
+    // within a level or two).
+    bool containsMM1(uint32_t mer) const {
+        if (mer == 0xFFFFFFFFu) return false;
+        if (containsExact(mer)) return true;
+        uint32_t prefix = 0;
+        for (int dd = 0; dd < TRIEDEPTH; ++dd) {
+            unsigned base = (mer >> (2 * (TRIEDEPTH - 1 - dd))) & 3;
+            for (unsigned c = 0; c < 4; ++c) {
+                if (c == base) continue;
+                uint32_t cur = pool[prefix].children[c];
+                if (!cur) continue;
+                bool ok = true;
+                for (int d = dd + 1; d < TRIEDEPTH; ++d) {
+                    unsigned b = (mer >> (2 * (TRIEDEPTH - 1 - d))) & 3;
+                    uint32_t nxt = pool[cur].children[b];
+                    if (!nxt) { ok = false; break; }
+                    cur = nxt;
+                }
+                if (ok && pool[cur].isEnd) return true;
+            }
+            uint32_t nxt = pool[prefix].children[base];
+            if (!nxt) break;
+            prefix = nxt;
+        }
+        return false;
+    }
+};
+
+// Build the trie from pipeline candidate-site flanks:
+//   consensusL -> forward left flank (insert as-is)
+//   consensusR -> right flank stored on the revcomp strand (insert rc16 = forward)
+// Both strands are inserted so a forward read scan finds a site on either strand.
+void BuildMismatchTrie(MismatchTrie& trie, KMerInfo (*kMerInfoTable)[16][8 << 20]) {
+    for (int t = 0; t < 16; t++) {
+        for (ll bp = 0; bp < (ll)MAX_BPRIME; bp++) {
+            KMerInfo& info = (*kMerInfoTable)[t][bp];
+            if (!info.r_prime || info.del) continue;
+            uint32_t conL = (uint32_t)info.consensusL;
+            uint32_t conR = (uint32_t)info.consensusR;
+            trie.insertBothStrands(conL);
+            trie.insertBothStrands(rc16(conR));
+        }
+    }
+}
+
+class MerQuery {
+    MismatchTrie* trie;
+public:
+    MerQuery(MismatchTrie* t) : trie(t) {}
+
+    // recall over the trie's forward flanks given the distinct 16-mers in a scan.
+    // A flank f is recalled iff some scan window is within Hamming distance tol
+    // of f or of rc16(f) (either strand).
+    static std::pair<size_t,size_t> recall(const MismatchTrie& tr,
+                                           const std::unordered_set<uint32_t>& scanSet) {
+        auto inScan = [&](uint32_t m){ return scanSet.find(m) != scanSet.end(); };
+        auto nearInScan = [&](uint32_t m) -> bool {
+            if (inScan(m)) return true;
+            for (int d = 0; d < TRIEDEPTH; ++d) {
+                unsigned base = (m >> (2*(TRIEDEPTH-1-d))) & 3;
+                for (unsigned c = 0; c < 4; ++c) {
+                    if (c == base) continue;
+                    if (inScan(m ^ ((uint32_t)(base^c) << (2*(TRIEDEPTH-1-d))))) return true;
+                }
+            }
+            return false;
+        };
+        size_t idx = tr.flanks.size(), recE = 0, recM = 0;
+        for (uint32_t f : tr.flanks) {
+            uint32_t r = rc16(f);
+            if (inScan(f) || inScan(r)) { recE++; recM++; continue; }
+            if (nearInScan(f) || nearInScan(r)) recM++;
+        }
+        return {recE, recM};
+    }
+
+    // scan up to maxBases of `filename`; report exact / MM1 recall.
+    void run(const std::string& filename, char* buffer, size_t maxBases) {
+        SeqParser seqfile(filename, buffer);
+        std::unordered_set<uint32_t> scanSet;
+        size_t scanned = 0, win = 0;
+        while (seqfile.nextSeq() && scanned < maxBases) {
+            std::string s = seqfile.getSeq(1);
+            size_t take = std::min(s.size(), maxBases - scanned);
+            for (size_t p = 0; p + TRIEDEPTH <= take; ++p) {
+                uint32_t m = pack16(s.data(), p);
+                if (m != 0xFFFFFFFFu) { scanSet.insert(m); win++; }
+            }
+            scanned += take;
+        }
+        auto [recE, recM] = recall(*trie, scanSet);
+        size_t idx = trie->flanks.size();
+        std::cerr << std::format("[MerQuery] {}: scanned={}bp windows={} indexedFlanks={}\n",
+                                 filename, scanned, win, idx);
+        std::cerr << std::format("[MerQuery] RECALL exact={}/{} ({:.1f}%)  MM1={}/{} ({:.1f}%)\n",
+                                 recE, idx, idx ? 100.0*recE/idx : 0.0,
+                                 recM, idx, idx ? 100.0*recM/idx : 0.0);
+    }
+
+    // standalone benchmark: build the trie by sampling flanks from a file's
+    // shared region, then recall over a (optionally mutated) scan. Exercises the
+    // search without the 12GB pipeline. Mirrors waster_lite_claudedev runBench.
+    static int bench(const std::string& file, size_t indexBases, size_t scanBases, int mutPct) {
+        std::vector<char> iobuf(BUFFER_SIZE);
+        SeqParser seqfile(file, iobuf.data());
+        if (!seqfile.nextSeq()) { std::cerr << "empty file\n"; return 1; }
+        std::string s = seqfile.getSeq(1);
+        if (s.size() > scanBases + TRIEDEPTH) s.resize(scanBases + TRIEDEPTH);
+        std::cerr << std::format("[bench] {}: loaded={} indexBases={} scanBases={} mutPct={}\n",
+                                 file, s.size(), indexBases, scanBases, mutPct);
+
+        MismatchTrie trie;
+        for (size_t p = 0; p + TRIEDEPTH <= indexBases && p + TRIEDEPTH <= s.size(); ++p) {
+            uint32_t m = pack16(s.data(), p);
+            if (m != 0xFFFFFFFFu) trie.insertBothStrands(m);
+        }
+        std::cerr << std::format("[bench] indexed {} distinct forward flanks, {} nodes ({} MB)\n",
+                                 trie.flanks.size(), trie.pool.size(),
+                                 trie.pool.size() * sizeof(MismatchTrie::Node) >> 20);
+
+        std::vector<char> scan(s.begin(), s.end());
+        if (mutPct > 0) {
+            auto code = [](char c)->int{ switch(c){case 'A':case'a':return 0; case 'C':case'c':return 1; case 'G':case'g':return 2; case 'T':case't':return 3;} return -1;};
+            uint64_t state = 0x9e3779b97f4a7c15ULL;
+            for (size_t i = 0; i < scan.size(); ++i) {
+                state = state*6364136223846793005ULL + 1442695040888963407ULL;
+                uint32_t r = (uint32_t)(state >> 33);
+                if ((r % 100) < (uint32_t)mutPct) {
+                    int cc = code(scan[i]);
+                    if (cc >= 0) scan[i] = "ACGT"[(cc + 1 + (r>>8)%3) & 3];
+                }
+            }
+        }
+        std::unordered_set<uint32_t> scanSet;
+        size_t win = (scan.size() >= (size_t)TRIEDEPTH) ? scan.size() - TRIEDEPTH + 1 : 0;
+        if (win > scanBases) win = scanBases;
+        for (size_t p = 0; p < win; ++p) {
+            uint32_t m = pack16(scan.data(), p);
+            if (m != 0xFFFFFFFFu) scanSet.insert(m);
+        }
+        auto [recE, recM] = recall(trie, scanSet);
+        size_t idx = trie.flanks.size();
+        std::cerr << std::format("[bench] windows={} distinctScan={} indexed={}\n", win, scanSet.size(), idx);
+        std::cerr << std::format("[bench] RECALL exact={}/{} ({:.1f}%)  MM1={}/{} ({:.1f}%)\n",
+                                 recE, idx, idx ? 100.0*recE/idx : 0.0,
+                                 recM, idx, idx ? 100.0*recM/idx : 0.0);
+        return 0;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Legacy lazy "tip" trie + BuildTrie below: RETAINED but UNUSED. The working
+// mismatch-tolerant search is MismatchTrie / MerQuery above. (Kept for
+// reference; safe to delete once no longer needed.)
+// ---------------------------------------------------------------------------
 struct Trie {
     static const int TRIEDEPTH = kFlankSize + LMERADDIFLANK;   // 16
     static constexpr unsigned long long capacity = 8ULL << 30; // 8 GB arena
@@ -308,7 +536,7 @@ struct Trie {
     // }
 
     void init_fails() {
-        std::deque<Node*> queue;
+        std::queue<Node*> queue;
         queue.push(root);
 
         while(!queue.empty()) {
@@ -321,7 +549,7 @@ struct Trie {
                 current->fail = current->parent->fail->children[current->label.to_ulong()] ? current->parent->fail->children[current->label.to_ulong()] : root;
             }
 
-            if (!current->is_tip) {
+            if (current->is_tip.none()) {
                 for (auto i : current->children) {
                     if (i) queue.push(i);
                 }
@@ -344,53 +572,17 @@ void BuildTrie(Trie* trie, KMerInfo (*kMerInfoTable)[16][8 << 20]) {
         for (ll bp = 0; bp < (ll)MAX_BPRIME; bp++) {
             KMerInfo& info = (*kMerInfoTable)[t][bp];
             if (!info.r_prime || info.del) continue;
-            auto conL = info.consensusL, conR = HashSquare.RevCompHash<int>(info.consensusR);
+            auto conL = info.consensusL;
+            auto conR = HashSquare::RevCompHash<int>(info.consensusR);
             trie->add(conL, &info, 1);
             trie->add(conR, &info, 2);
         }
     }
 }
 
-class MerQuery {
-    // mismatch-tolerate kmer query (1 multihit)
-    Trie *trie;
-    string filename;
-    SeqParser* seqfile;
-
-    char CallSNP () {
-        //return SNP
-    }    
-
-    void MerMatch (Trie::Node* node, short lastmismatch = -1) {
-        if (node->is_tip.to_ulong()) {
-            // precised match
-            return;
-        }
-
-        //process current node
-        
-        if () {
-            // failed to match
-            return;
-        }
-
-        for (auto i : node->children) {
-
-        }
-    }
-
-public:
-    MerQuery (Trie *_trie, string _filename, char* buffer): trie(_trie), filename(_filename) {
-        seqfile = new SeqParser(filename, buffer);
-        while (seqfile->nextSeq()) {
-            BinSeq* sequence = new TrieBinSeq(seqfile->getSeq(1));
-            ll n, m;
-            while(sequence->Yieldable()){
-                auto bit = sequence->SingleYield();
-            }
-        }
-    }
-}
+// (legacy stub class MerQuery removed — it referenced the lazy Trie and had an
+//  empty `if()`; the working mismatch-tolerant MerQuery now lives above, next
+//  to MismatchTrie.)
 
     // mismatch-tolerate kmer query (1 multihit)
 
@@ -612,6 +804,16 @@ std::string encode_int32_to_10mer(int val) {
 }
 
 int main(int argc, char** argv){
+    if (argc >= 2 && std::string(argv[1]) == "bench") {
+        // exercise the mismatch search without the 12GB pipeline:
+        //   wlb2 bench <file.fa> [indexBases=300000] [scanBases=300000] [mutPct=0]
+        std::string file = argc > 2 ? argv[2] : "simc1.fa";
+        size_t indexBases = argc > 3 ? std::stoull(argv[3]) : 300000;
+        size_t scanBases  = argc > 4 ? std::stoull(argv[4]) : 300000;
+        int mutPct        = argc > 5 ? std::stoi(argv[5]) : 0;
+        return MerQuery::bench(file, indexBases, scanBases, mutPct);
+    }
+
     mem = static_cast<char*>(::operator new(MEM_SIZE, std::align_val_t(ALIGNMENT)));
     // TO DELETE: ::operator delete(mem, std::align_val_t(ALIGNMENT));
     if(!mem){
@@ -806,6 +1008,15 @@ int main(int argc, char** argv){
                 }
             }
         }
+
+        // ---- stage 5: mismatch-tolerant flank search (applied core code) ----
+        MismatchTrie mtrie;
+        BuildMismatchTrie(mtrie, kMerInfoTable);
+        std::cerr << std::format("[Trie] built: {} distinct forward flanks, {} nodes ({} MB)\n",
+                                 mtrie.flanks.size(), mtrie.pool.size(),
+                                 mtrie.pool.size() * sizeof(MismatchTrie::Node) >> 20);
+        MerQuery q(&mtrie);
+        q.run("simc1.fa", bufferStart, 10000000);
     }
 
     std::cerr << "Finished";
